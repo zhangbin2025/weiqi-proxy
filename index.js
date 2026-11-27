@@ -166,13 +166,13 @@ function validateTargetUrl(raw) {
 }
 
 function isPrivateHost(hostname) {
-  const h = hostname.toLowerCase().replace(/\\.$/, '');
+  const h = hostname.toLowerCase().replace(/\.$/, '');
   const bare = h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
 
   if (bare === 'localhost' || bare.endsWith('.localhost') || bare.endsWith('.local')) return true;
   if (bare === '::' || bare === '::1') return true;
   // IPv4-mapped IPv6: Cloudflare URL parsing may normalize dotted tails to hex.
-  const mapped = bare.match(/^::ffff:(?:(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/);
+  const mapped = bare.match(/^::ffff:(?:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/);
   if (mapped) {
     const octets = mapped[1] !== undefined
       ? mapped.slice(1, 5).map(Number)
@@ -188,16 +188,16 @@ function isPrivateHost(hostname) {
 }
 
 function isPrivateIpv4(octets) {
-  const [a, b] = octets;
+  const [a, b, c] = octets;
   // Private, loopback, link-local, shared-address (CGNAT), protocol-assignment,
   // benchmarking, documentation, multicast and reserved ranges.
   if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
   if (a === 100 && b >= 64 && b <= 127) return true;
   if (a === 169 && b === 254) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && (b === 0 || b === 168 || b === 0 || b === 2)) return true;
-  if (a === 198 && (b === 18 || b === 19 || b === 51)) return true;
-  if (a === 203 && b === 0) return true;
+  if (a === 192 && (b === 168 || (b === 0 && (c === 0 || c === 2)))) return true;
+  if (a === 198 && ((b === 18 || b === 19) || (b === 51 && c === 100))) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
   return false;
 }
 

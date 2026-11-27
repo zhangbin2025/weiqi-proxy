@@ -39,18 +39,11 @@ export default {
     try {
       // 出站头由请求端指定，代理只做透传，不注入任何业务站点默认的
       // Referer / User-Agent。
-      const proxyOptions = {
-        method: request.method,
-        headers: buildOutboundHeaders(request.headers),
-      };
-
-      // 有 body 的方法转发请求体
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        const body = await request.text();
-        if (body) proxyOptions.body = body;
-      }
-
-      const response = await fetch(targetUrl, proxyOptions);
+      const method = request.method;
+      const headers = new Headers(buildOutboundHeaders(request.headers));
+      // 有 body 的方法转发请求体；手动跟随重定向时可按 Fetch 语义决定是否保留。
+      const body = method !== 'GET' && method !== 'HEAD' ? await request.text() : undefined;
+      const response = await fetchPublicTarget(targetUrl, { method, headers, body });
 
       // 全量按字节透传：不做 text() 的 UTF-8 解码/重编码往返。
       // Workers 的 fetch 已自动解压上游 gzip/br，这里拿到的是解压后的原始
@@ -82,6 +75,68 @@ function jsonError(message, status) {
   });
 }
 
+// 手动处理重定向，确保每一跳都重新执行目标 URL 校验，而不是把安全边界
+// 交给 fetch 的自动重定向实现。20 跳与 Fetch 标准的重定向循环上限一致。
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 20;
+const SENSITIVE_REDIRECT_HEADERS = [
+  'authorization', 'cookie', 'proxy-authorization', 'referer',
+  'appkey', 'checksum', 'accesstoken', 'nonce', 'curtime',
+  'timestamp', 'usertoken', 'uuid',
+];
+
+async function fetchPublicTarget(rawUrl, init) {
+  let current = new URL(rawUrl);
+  let method = init.method;
+  let body = init.body;
+  const headers = new Headers(init.headers);
+
+  for (let redirects = 0; ; redirects += 1) {
+    const response = await fetch(current.toString(), {
+      method,
+      headers,
+      ...(body !== undefined ? { body } : {}),
+      redirect: 'manual',
+    });
+    const location = response.headers.get('location');
+    if (!REDIRECT_STATUSES.has(response.status) || !location) return response;
+
+    if (redirects >= MAX_REDIRECTS) {
+      try { await response.body?.cancel(); } catch { /* release best-effort */ }
+      throw new Error('Too many redirects');
+    }
+
+    let next;
+    try {
+      next = new URL(location, current);
+    } catch {
+      try { await response.body?.cancel(); } catch { /* release best-effort */ }
+      throw new Error('Invalid redirect URL');
+    }
+    const invalidReason = validateTargetUrl(next.toString());
+    if (invalidReason) {
+      try { await response.body?.cancel(); } catch { /* release best-effort */ }
+      throw new Error('Redirect blocked: ' + invalidReason);
+    }
+
+    // 跨 origin 跳转不转发凭据、Cookie 或站点身份头，避免开放代理替目标站泄漏凭证。
+    if (next.origin !== current.origin) {
+      for (const name of SENSITIVE_REDIRECT_HEADERS) headers.delete(name);
+    }
+
+    // 与 Fetch redirect 语义一致：303（HEAD 除外）以及 301/302 POST 改为 GET。
+    if ((response.status === 303 && method !== 'HEAD')
+      || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+      method = 'GET';
+      body = undefined;
+      headers.delete('content-type');
+    }
+
+    try { await response.body?.cancel(); } catch { /* release best-effort */ }
+    current = next;
+  }
+}
+
 // ============ 目标 URL 校验（最小协议防护） ============
 
 /**
@@ -103,6 +158,7 @@ function validateTargetUrl(raw) {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return 'Only http/https urls are allowed';
   }
+  if (parsed.username || parsed.password) return 'URL credentials are not allowed';
   if (isPrivateHost(parsed.hostname)) {
     return 'Private or loopback targets are not allowed';
   }
@@ -110,25 +166,38 @@ function validateTargetUrl(raw) {
 }
 
 function isPrivateHost(hostname) {
-  const h = hostname.toLowerCase();
+  const h = hostname.toLowerCase().replace(/\.$/, '');
   const bare = h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
 
   if (bare === 'localhost' || bare.endsWith('.localhost') || bare.endsWith('.local')) return true;
-  if (bare === '::1' || bare.startsWith('::ffff:127.')) return true;
-  if (bare.startsWith('fc') || bare.startsWith('fd') || bare.startsWith('fe80')) return true;
+  if (bare === '::' || bare === '::1') return true;
+  // IPv4-mapped IPv6: Cloudflare URL parsing may normalize dotted tails to hex.
+  const mapped = bare.match(/^::ffff:(?:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/);
+  if (mapped) {
+    const octets = mapped[1] !== undefined
+      ? mapped.slice(1, 5).map(Number)
+      : [Number.parseInt(mapped[4].slice(0, 2), 16), Number.parseInt(mapped[4].slice(2), 16), Number.parseInt(mapped[5].slice(0, 2), 16), Number.parseInt(mapped[5].slice(2), 16)];
+    if (isPrivateIpv4(octets)) return true;
+  }
+  if (/^f[cd][0-9a-f]*:/i.test(bare) || /^fe[89ab][0-9a-f]*:/i.test(bare)
+    || bare.startsWith('ff') || bare.startsWith('2002:') || bare.startsWith('64:ff9b:')) return true;
 
   const v4 = bare.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (v4) {
-    const a = Number(v4[1]);
-    const b = Number(v4[2]);
-    // RFC 5735 (0/8, 127/8, 224/4+), RFC 1918 (10/8, 172.16/12, 192.168/16),
-    // RFC 3927 (169.254/16)
-    if (a === 0 || a === 127 || a >= 224) return true;
-    if (a === 10) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 169 && b === 254) return true;
-  }
+  if (v4) return isPrivateIpv4(v4.slice(1, 5).map(Number));
+  return false;
+}
+
+function isPrivateIpv4(octets) {
+  const [a, b, c] = octets;
+  // Private, loopback, link-local, shared-address (CGNAT), protocol-assignment,
+  // benchmarking, documentation, multicast and reserved ranges.
+  if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && (b === 168 || (b === 0 && (c === 0 || c === 2)))) return true;
+  if (a === 198 && ((b === 18 || b === 19) || (b === 51 && c === 100))) return true;
+  if (a === 203 && b === 0 && c === 113) return true;
   return false;
 }
 
